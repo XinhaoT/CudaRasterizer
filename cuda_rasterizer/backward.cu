@@ -15,6 +15,251 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+__global__ void Init3dGradsCUDA(
+	const int P, int D, int M,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D
+	)
+{
+	int idx = cg::this_grid().thread_rank();
+	if (idx >= P*D*M)
+		return;
+	
+	dF_dshs[idx] = 0.0;
+
+	if (idx < P){
+		dF_dopacity[idx] = 0.0;
+	}
+	if (idx < P*3){
+		dF_dpos[idx] = 0.0;
+		dF_dscale[idx] = 0.0;
+	}
+	if (idx < P*4){
+		dF_drot[idx] = 0.0;
+	}
+	if (idx < P*9){
+		dF_dcov3D[idx] = 0.0;
+	}
+
+}
+
+
+__global__ void computeGradsForAdaCov3D(
+	int P,
+	float* dF_dcov3D,
+	const float* ada_lpf_ratio
+)
+{
+	int gs_idx = cg::this_grid().thread_rank();
+	if (gs_idx >= P)
+		return;
+	
+	// dF_dcov3D[9*gs_idx + 0] += ada_lpf_ratio[3*gs_idx + 0];
+	// dF_dcov3D[9*gs_idx + 4] += ada_lpf_ratio[3*gs_idx + 1];
+	// dF_dcov3D[9*gs_idx + 8] += ada_lpf_ratio[3*gs_idx + 2];
+	return;
+}
+
+__global__ void computeGradsFromCov3D(
+	int P, 
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* dF_dcov3D,
+	float* dF_drot,
+	float* dF_dscale,
+	float* ada_lpf_ratio,
+	bool* opt_options_cuda
+	)
+{
+	int gs_idx = cg::this_grid().thread_rank();
+	if (gs_idx >= P)
+		return;
+
+	glm::mat3 S = glm::mat3(1.0f);
+
+	// if (opt_options_cuda[9]){
+	// 	S[0][0] = exp(scale_cuda[gs_idx*3 + 0])*(1.0f + ada_lpf_ratio[gs_idx*3 + 0]);
+	// 	S[1][1] = exp(scale_cuda[gs_idx*3 + 1])*(1.0f + ada_lpf_ratio[gs_idx*3 + 1]);
+	// 	S[2][2] = exp(scale_cuda[gs_idx*3 + 2])*(1.0f + ada_lpf_ratio[gs_idx*3 + 2]);
+	// }
+	// else{
+	// 	S[0][0] = exp(scale_cuda[gs_idx*3 + 0])+1e-3f;
+	// 	S[1][1] = exp(scale_cuda[gs_idx*3 + 1])+1e-3f;
+	// 	S[2][2] = exp(scale_cuda[gs_idx*3 + 2])+1e-3f;
+	// }
+
+	S[0][0] = exp(scale_cuda[gs_idx*3 + 0]);
+	S[1][1] = exp(scale_cuda[gs_idx*3 + 1]);
+	S[2][2] = exp(scale_cuda[gs_idx*3 + 2]);
+
+	float r = rot_cuda[gs_idx*4 + 0];
+	float x = rot_cuda[gs_idx*4 + 1];
+	float y = rot_cuda[gs_idx*4 + 2];
+	float z = rot_cuda[gs_idx*4 + 3];
+	float norm = sqrt(r*r + x*x + y*y + z*z);
+	r = r / norm;
+	x = x / norm;
+	y = y / norm;
+	z = z / norm;
+
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat3 M = S * R;
+
+
+	glm::mat3 dL_dSigma = glm::mat3(
+		dF_dcov3D[9* gs_idx + 0], 0.5f * dF_dcov3D[9* gs_idx + 1], 0.5f * dF_dcov3D[9* gs_idx + 2],
+		0.5f * dF_dcov3D[9* gs_idx + 1], dF_dcov3D[9* gs_idx + 4], 0.5f * dF_dcov3D[9* gs_idx + 5],
+		0.5f * dF_dcov3D[9* gs_idx + 2], 0.5f * dF_dcov3D[9* gs_idx + 5], dF_dcov3D[9* gs_idx + 8]
+	);
+
+
+	glm::mat3 dL_dM = 2.0f * M * dL_dSigma;
+
+	glm::mat3 Rt = glm::transpose(R);
+	glm::mat3 dL_dMt = glm::transpose(dL_dM);
+
+	dF_dscale[gs_idx*3 + 0] = glm::dot(Rt[0], dL_dMt[0])*exp(scale_cuda[gs_idx*3 + 0]);
+	dF_dscale[gs_idx*3 + 1] = glm::dot(Rt[1], dL_dMt[1])*exp(scale_cuda[gs_idx*3 + 1]);
+	dF_dscale[gs_idx*3 + 2] = glm::dot(Rt[2], dL_dMt[2])*exp(scale_cuda[gs_idx*3 + 2]);
+
+	// dF_dscale[gs_idx*3 + 0] = glm::dot(Rt[0], dL_dMt[0])*exp(scale_cuda[gs_idx*3 + 0])*(1.0f + ada_lpf_ratio[gs_idx*3 + 0]);
+	// dF_dscale[gs_idx*3 + 1] = glm::dot(Rt[1], dL_dMt[1])*exp(scale_cuda[gs_idx*3 + 1])*(1.0f + ada_lpf_ratio[gs_idx*3 + 1]);
+	// dF_dscale[gs_idx*3 + 2] = glm::dot(Rt[2], dL_dMt[2])*exp(scale_cuda[gs_idx*3 + 2])*(1.0f + ada_lpf_ratio[gs_idx*3 + 2]);
+
+
+	dL_dMt[0] *= S[0][0];
+	dL_dMt[1] *= S[1][1];
+	dL_dMt[2] *= S[2][2];
+
+
+	float dF_drot0 = 2 * z * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * y * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * x * (dL_dMt[1][2] - dL_dMt[2][1]);
+
+	float dF_drot1 = 2 * y * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * z * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * r * (dL_dMt[1][2] - dL_dMt[2][1]) - 4 * x * (dL_dMt[2][2] + dL_dMt[1][1]);
+
+	float dF_drot2 = 2 * x * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * r * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * z * (dL_dMt[1][2] + dL_dMt[2][1]) - 4 * y * (dL_dMt[2][2] + dL_dMt[0][0]);
+
+	float dF_drot3 = 2 * r * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * x * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * y * (dL_dMt[1][2] + dL_dMt[2][1]) - 4 * z * (dL_dMt[1][1] + dL_dMt[0][0]);
+
+	r = rot_cuda[gs_idx*4 + 0];
+	x = rot_cuda[gs_idx*4 + 1];
+	y = rot_cuda[gs_idx*4 + 2];
+	z = rot_cuda[gs_idx*4 + 3];
+
+
+	float divisor = pow(r*r + x*x + y*y + z*z, 3/2);
+	dF_drot[gs_idx*4 + 0] = dF_drot0 * ((x*x + y*y + z*z)/divisor);
+	dF_drot[gs_idx*4 + 0] -= dF_drot1 * ((r*x)/divisor);
+	dF_drot[gs_idx*4 + 0] -= dF_drot2 * ((r*y)/divisor);
+	dF_drot[gs_idx*4 + 0] -= dF_drot3 * ((r*z)/divisor);
+
+	dF_drot[gs_idx*4 + 1] = dF_drot1 * ((r*r + y*y + z*z)/divisor);
+	dF_drot[gs_idx*4 + 1] -= dF_drot0 * ((x*r)/divisor);
+	dF_drot[gs_idx*4 + 1] -= dF_drot2 * ((x*y)/divisor);
+	dF_drot[gs_idx*4 + 1] -= dF_drot3 * ((x*z)/divisor);
+
+	dF_drot[gs_idx*4 + 2] = dF_drot2 * ((r*r + x*x + z*z)/divisor);
+	dF_drot[gs_idx*4 + 2] -= dF_drot0 * ((y*r)/divisor);
+	dF_drot[gs_idx*4 + 2] -= dF_drot1 * ((y*x)/divisor);
+	dF_drot[gs_idx*4 + 2] -= dF_drot3 * ((y*z)/divisor);
+
+	dF_drot[gs_idx*4 + 3] = dF_drot3 * ((r*r + x*x + y*y)/divisor);
+	dF_drot[gs_idx*4 + 3] -= dF_drot0 * ((z*r)/divisor);
+	dF_drot[gs_idx*4 + 3] -= dF_drot1 * ((z*x)/divisor);
+	dF_drot[gs_idx*4 + 3] -= dF_drot2 * ((z*y)/divisor);
+
+}
+
+
+__global__ void computeGradsFromINVCov3D(
+	int P, 
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* sigma_inv_cuda,
+	const float* dF_dcov3D_inv,
+	float* dF_drot,
+	float* dF_dscale
+	)
+{
+	int gs_idx = cg::this_grid().thread_rank();
+	if (gs_idx >= P)
+		return;
+}
+
+
+__device__ void computeGradsFromPDF(
+	int gs_idx, 
+	float cur_dF_dpdf,
+	float log_pdf,
+	const float* samples_pos,
+	const float* A, // sigma_inv_cuda
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D,
+	float* ada_lpf_ratio
+	)
+{	
+	float dF_dlogpdf = cur_dF_dpdf*(-0.5*exp(-0.5*log_pdf));
+
+	float dF_dx =  dF_dlogpdf * 2 * (A[0]* (pos_cuda[0] - samples_pos[0]));
+	dF_dx += dF_dlogpdf * 2 * (A[1] * (pos_cuda[1] - samples_pos[1]));
+	dF_dx += dF_dlogpdf * 2 * (A[2] * (pos_cuda[2] - samples_pos[2]));
+
+	float dF_dy =  dF_dlogpdf * 2 * (A[1]* (pos_cuda[0] - samples_pos[0]));
+	dF_dy +=  dF_dlogpdf * 2 * (A[4]* (pos_cuda[1] - samples_pos[1]));
+	dF_dy +=  dF_dlogpdf * 2 * (A[5]* (pos_cuda[2] - samples_pos[2]));
+	
+	float dF_dz =  dF_dlogpdf * 2 * (A[2]* (pos_cuda[0] - samples_pos[0]));
+	dF_dz +=  dF_dlogpdf * 2 * (A[5]* (pos_cuda[1] - samples_pos[1]));
+	dF_dz +=  dF_dlogpdf * 2 * (A[8]* (pos_cuda[2] - samples_pos[2]));
+
+
+	atomicAdd(&dF_dpos[3* gs_idx + 0], dF_dx);
+	atomicAdd(&dF_dpos[3* gs_idx + 1], dF_dy);
+	atomicAdd(&dF_dpos[3* gs_idx + 2], dF_dz);
+
+	float x = samples_pos[0] - pos_cuda[0];
+	float y = samples_pos[1] - pos_cuda[1];
+	float z = samples_pos[2] - pos_cuda[2];	
+
+	glm::mat3 dF_dcov3D_inv = glm::mat3(
+		dF_dlogpdf*x*x, dF_dlogpdf*x*y, dF_dlogpdf*x*z,
+		dF_dlogpdf*x*y, dF_dlogpdf*y*y, dF_dlogpdf*y*z,
+		dF_dlogpdf*x*z, dF_dlogpdf*y*z, dF_dlogpdf*z*z
+	);
+
+	glm::vec3 v = glm::vec3(x, y, z);
+	glm::mat3 sigma_inv = glm::mat3(
+		A[0], A[1], A[2],
+		A[1], A[4], A[5],
+		A[2], A[5], A[8]
+	);
+
+	glm::vec3 dpdf_dsigma0 = sigma_inv * v;
+	glm::mat3 dpdf_dsigma1 = glm::outerProduct(dpdf_dsigma0, v);
+	glm::mat3 dpdf_dsigma2 = dpdf_dsigma1 * sigma_inv;
+
+	atomicAdd(&dF_dcov3D[9* gs_idx + 0], 0.5f * cur_dF_dpdf * exp(-0.5*log_pdf) * dpdf_dsigma2[0][0]);
+	atomicAdd(&dF_dcov3D[9* gs_idx + 1], 0.5f * cur_dF_dpdf * exp(-0.5*log_pdf) * dpdf_dsigma2[0][1] * 2);
+	atomicAdd(&dF_dcov3D[9* gs_idx + 2], 0.5f * cur_dF_dpdf * exp(-0.5*log_pdf) * dpdf_dsigma2[0][2] * 2);
+	atomicAdd(&dF_dcov3D[9* gs_idx + 4], 0.5f * cur_dF_dpdf * exp(-0.5*log_pdf) * dpdf_dsigma2[1][1]);
+	atomicAdd(&dF_dcov3D[9* gs_idx + 5], 0.5f * cur_dF_dpdf * exp(-0.5*log_pdf) * dpdf_dsigma2[1][2] * 2);
+	atomicAdd(&dF_dcov3D[9* gs_idx + 8], 0.5f * cur_dF_dpdf * exp(-0.5*log_pdf) * dpdf_dsigma2[2][2]);
+
+}
+
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
@@ -556,6 +801,418 @@ renderCUDA(
 	}
 }
 
+__global__ void Clip3dGradsCUDA(
+	const int N, int D, int M,
+	const int P,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_drot,
+	float* dF_dscale
+){
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	// for (int i = 0; i < D; i++){
+	// 	dF_dshs[idx*D*M + i] = min(1.0f, dF_dshs[idx*D*M + i]);
+	// 	dF_dshs[idx*D*M + i] = max(-1.0f, dF_dshs[idx*D*M + i]);
+	// }
+
+	// dF_dopacity[idx] = min(1.0f, dF_dopacity[idx]);
+	// dF_dopacity[idx] = max(-1.0f, dF_dopacity[idx]);
+
+	for (int i = 0; i < 4; i++){
+		dF_drot[idx*4 + i] = min(1.0f, dF_drot[idx*D*M + i]);
+		dF_drot[idx*4 + i] = max(-1.0f, dF_drot[idx*D*M + i]);
+	}
+}
+
+__global__ void StepIncrement(
+	int* step
+){
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= 1)
+		return;
+	atomicAdd(&(step[0]), 1);
+}
+
+__global__ void CheckScaleCUDA(
+	int P,
+	float* scale_cuda,
+	float* max_scale_cuda
+){
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+	
+	for (int i = 0; i < 3; i++){
+		if ((scale_cuda[idx*3 + i] > max_scale_cuda[idx*3 + i]) && (scale_cuda[idx*3 + i] > -2.0f)){
+		// if ((scale_cuda[idx*3 + i] > max_scale_cuda[idx*3 + i])){
+			scale_cuda[idx*3 + i] = max_scale_cuda[idx*3 + i];
+			// printf("Scale Exceeded %f\n", scale_cuda[idx*3 + i]);
+		}
+	}
+}
+
+__global__ void CheckOpacityCUDA(
+	int P,
+	float* opacity_cuda
+){
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+	
+	if (sigmoid(opacity_cuda[idx]) < 0.001f){
+		opacity_cuda[idx] = 0.0;
+	} 
+}
+
+__global__ void Updatefeature3dCUDA(
+	const int P, int D, int M,
+	const float* dF_dopacity,
+	const float* dF_dshs,
+	const float* dF_dpos,
+	const float* dF_drot,
+	const float* dF_dscale,
+	float* opacity_cuda,
+	float* shs_cuda,
+	float* pos_cuda,
+	float* rot_cuda,
+	float* scale_cuda,
+	float* m_opacity,
+	float* v_opacity,
+	float* m_shs,
+	float* v_shs,
+	float* m_pos,
+	float* v_pos,
+	float* m_rot,
+	float* v_rot,
+	float* m_scale,
+	float* v_scale,
+	float* max_scale_cuda,
+	int* step,
+	bool* opt_options_cuda,
+	float* learning_rate_cuda,
+	int _optimize_steps,
+	int* moved_gaussians_cuda
+)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	if (moved_gaussians_cuda[idx] == 0){
+		return;
+	}
+
+	int shs_dim = D;
+	if (opt_options_cuda[5]){
+		shs_dim = D*M;
+	}
+	
+	float beta1 = 0.9;
+	float beta2 = 0.999;
+	float epsilon = 1e-15;
+
+	float t = min(((float)step[0]) / (float)100.0, 1.0);
+    float lr_pos = exp(log(0.00032) * (1 - t) + log(0.0000064) * t);
+
+	m_opacity[idx] = beta1*m_opacity[idx] + (1-beta1)*dF_dopacity[idx];
+	v_opacity[idx] = beta2*v_opacity[idx] + (1-beta2)*dF_dopacity[idx]*dF_dopacity[idx];
+	for (int i = 0; i < shs_dim; i++){
+		m_shs[idx*D*M + i] = beta1*m_shs[idx*D*M + i] + (1-beta1)*dF_dshs[idx*D*M + i];
+		v_shs[idx*D*M + i] = beta2*v_shs[idx*D*M + i] + (1-beta2)*dF_dshs[idx*D*M + i]*dF_dshs[idx*D*M + i];
+	}
+	for (int i = 0; i < 3; i++){
+		m_pos[idx*3 + i] = beta1*m_pos[idx*3 + i] + (1-beta1)*dF_dpos[idx*3 + i];
+		v_pos[idx*3 + i] = beta2*v_pos[idx*3 + i] + (1-beta2)*dF_dpos[idx*3 + i]*dF_dpos[idx*3 + i];
+	}
+	for (int i = 0; i < 4; i++){
+		m_rot[idx*4 + i] = beta1*m_rot[idx*4 + i] + (1-beta1)*dF_drot[idx*4 + i];
+		v_rot[idx*4 + i] = beta2*v_rot[idx*4 + i] + (1-beta2)*dF_drot[idx*4 + i]*dF_drot[idx*4 + i];
+	}
+	for (int i = 0; i < 3; i++){
+		m_scale[idx*3 + i] = beta1*m_scale[idx*3 + i] + (1-beta1)*dF_dscale[idx*3 + i];
+		v_scale[idx*3 + i] = beta2*v_scale[idx*3 + i] + (1-beta2)*dF_dscale[idx*3 + i]*dF_dscale[idx*3 + i];
+	}	
+
+	float mt_o = m_opacity[idx] / (1-pow(beta1, (float)step[0]));
+	float vt_o = v_opacity[idx] / (1-pow(beta2, (float)step[0]));
+	if (opt_options_cuda[3]){
+		atomicAdd(&opacity_cuda[idx], -(learning_rate_cuda[3]*mt_o) / (sqrt(vt_o)+epsilon));
+	}
+
+	for (int i = 0; i < shs_dim; i++){
+		float mt_s = m_shs[idx*D*M + i] / (1-pow(beta1, (float)step[0]));
+		float vt_s = v_shs[idx*D*M + i] / (1-pow(beta2, (float)step[0]));
+		if (opt_options_cuda[4]){
+			atomicAdd(&shs_cuda[idx*D*M + i], -(learning_rate_cuda[4]*mt_s) / (sqrt(vt_s)+epsilon));
+		}
+	}
+
+	for (int i = 0; i < 3; i++){
+		float mt_pos = m_pos[idx*3 + i] / (1-pow(beta1, (float)step[0]));
+		float vt_pos = v_pos[idx*3 + i] / (1-pow(beta2, (float)step[0]));
+		if (opt_options_cuda[0]){
+			atomicAdd(&pos_cuda[idx*3 + i], -(lr_pos*mt_pos) / (sqrt(vt_pos)+epsilon));
+		}
+	}
+
+	for (int i = 0; i < 4; i++){
+		float mt_rot = m_rot[idx*4 + i] / (1-pow(beta1, (float)step[0]));
+		float vt_rot = v_rot[idx*4 + i] / (1-pow(beta2, (float)step[0]));
+		if (opt_options_cuda[1]){
+			atomicAdd(&rot_cuda[idx*4 + i], -(learning_rate_cuda[1]*mt_rot) / (sqrt(vt_rot)+epsilon));
+		}
+	}
+
+	for (int i = 0; i < 3; i++){
+		float mt_scale = m_scale[idx*3 + i] / (1-pow(beta1, (float)step[0]));
+		float vt_scale = v_scale[idx*3 + i] / (1-pow(beta2, (float)step[0]));
+		if (opt_options_cuda[2]){
+			atomicAdd(&scale_cuda[idx*3 + i], -(learning_rate_cuda[2]*mt_scale) / (sqrt(vt_scale)+epsilon));
+		}
+	}
+
+}
+
+__global__ void compute3dgradsCUDA_grid(
+	const int valid_grid_num, int D, int M,
+	const int P, int S_PerGird,
+	const int* valid_grid_cuda,
+	const int* grid_gs_prefix_sum_cuda,
+	const float* samples_pos,
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	const float* sigma_inv_cuda,
+	float* sigma_damp_cuda,
+	const float* opacity_grad_cuda,
+	const float* feature_grad_cuda,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D,
+	const int* grided_gs_idx_cuda,
+	bool* grid_is_converged_cuda,
+	bool* opt_options_cuda,
+	float3 min_xyz,
+	float grid_step,
+	int grid_num,
+	float* ada_lpf_ratio,
+	int* empty_grid_cuda,
+	int* current_static_grids_cuda,
+	int* moved_gaussians_cuda,
+	bool has_soup
+	)
+{
+	if (grid_is_converged_cuda[blockIdx.x] && opt_options_cuda[11]){
+		return;
+	}
+
+	int shs_dim = D;
+	if (opt_options_cuda[5]){
+		shs_dim = D*M;
+	}
+
+	auto idx = cg::this_grid().thread_rank();
+
+	//
+	if ((empty_grid_cuda[blockIdx.x] == 1) && opt_options_cuda[11]){
+		return;
+	}
+	//
+	int sample_idx_in_grid = threadIdx.x;
+	
+	int sp_idx = blockIdx.x * S_PerGird + sample_idx_in_grid;
+
+	int x_idx = int(floor((samples_pos[sp_idx*3 + 0] - min_xyz.x)/grid_step));
+	if ((x_idx < 0) || (x_idx >= grid_num)){
+		return;
+	}
+	int y_idx = int(floor((samples_pos[sp_idx*3 + 1] - min_xyz.y)/grid_step));
+	if ((y_idx < 0) || (y_idx >= grid_num)){
+		return;
+	}
+	int z_idx = int(floor((samples_pos[sp_idx*3 + 2] - min_xyz.z)/grid_step));
+	if ((z_idx < 0) || (z_idx >= grid_num)){
+		return;
+	}
+	int cur_grid_idx = x_idx*grid_num*grid_num + y_idx*grid_num + z_idx;
+
+	if ((current_static_grids_cuda[cur_grid_idx] == 1) && opt_options_cuda[11]){
+		return;
+	}
+
+	int gs_idx_start = 0;
+	int gs_idx_end = grid_gs_prefix_sum_cuda[cur_grid_idx];
+	if (cur_grid_idx != 0){
+		gs_idx_start = grid_gs_prefix_sum_cuda[cur_grid_idx-1];
+	}
+
+	float alpha_threshold = 1.0f/255.0f;
+	if (has_soup){
+		alpha_threshold = 1.0f/1000.0f;
+	}
+
+
+	for (int i = gs_idx_start; i < gs_idx_end; i++){
+		int gs_idx = grided_gs_idx_cuda[i];
+		if (moved_gaussians_cuda[gs_idx] == 0){
+			continue;
+		}
+
+		float x = samples_pos[sp_idx*3 + 0] - pos_cuda[gs_idx*3 + 0];
+		float y = samples_pos[sp_idx*3 + 1] - pos_cuda[gs_idx*3 + 1];
+		float z = samples_pos[sp_idx*3 + 2] - pos_cuda[gs_idx*3 + 2];
+
+		float log_pdf = 0.0;
+		log_pdf += sigma_inv_cuda[9*gs_idx + 0] * x * x;
+		log_pdf += sigma_inv_cuda[9*gs_idx + 1] * x * y * 2;
+		log_pdf += sigma_inv_cuda[9*gs_idx + 2] * x * z * 2;
+		log_pdf += sigma_inv_cuda[9*gs_idx + 4] * y * y;
+		log_pdf += sigma_inv_cuda[9*gs_idx + 5] * y * z * 2;
+		log_pdf += sigma_inv_cuda[9*gs_idx + 8] * z * z;
+
+		float cur_pdf;
+
+		cur_pdf = exp(-0.5 *log_pdf);
+
+		float sigmoid_opa = 1.0f / (1.0f + exp(-opacity_cuda[gs_idx]));
+		if (cur_pdf * sigmoid_opa < alpha_threshold){
+			continue;
+		}
+		float d_sigmoid_opa = (exp(-opacity_cuda[gs_idx])) / ((1.0f + exp(-opacity_cuda[gs_idx])) * (1.0f + exp(-opacity_cuda[gs_idx])));
+
+
+		float cur_dF_do = 0.0f;
+		float cur_dF_dshs = cur_pdf*sigmoid_opa;
+		float cur_dF_dpdf = 0.0f;
+		for (int j = 0; j < shs_dim; j++){
+			cur_dF_do += shs_cuda[D*M*gs_idx + j] * feature_grad_cuda[D*M*sp_idx + j];
+			cur_dF_dpdf += shs_cuda[D*M*gs_idx + j] * feature_grad_cuda[D*M*sp_idx + j];
+		}
+		// opacity loss
+		cur_dF_do += opacity_grad_cuda[sp_idx];
+		cur_dF_dpdf += opacity_grad_cuda[sp_idx];
+		//
+		cur_dF_do = d_sigmoid_opa * cur_pdf * cur_dF_do;
+		cur_dF_dpdf = sigmoid_opa * cur_dF_dpdf;
+
+		for (int j = 0; j < shs_dim; j++){
+			atomicAdd(&dF_dshs[D*M * gs_idx + j], cur_dF_dshs*feature_grad_cuda[D*M*sp_idx + j]);
+		}
+		atomicAdd(&dF_dopacity[gs_idx], cur_dF_do);
+
+
+		// Calculate the dF_dpos, dF_drot, and dF_dscale from dF_dpdf
+		if (cur_dF_dpdf != 0.0) {
+			computeGradsFromPDF(gs_idx, cur_dF_dpdf, log_pdf, samples_pos+sp_idx*3, sigma_inv_cuda+gs_idx*9, pos_cuda+gs_idx*3, rot_cuda+gs_idx*4, scale_cuda+gs_idx*3, dF_dpos, dF_drot, dF_dscale, dF_dcov3D, ada_lpf_ratio);
+		}
+	}
+
+}
+
+
+__global__ void compute3dgradsCUDA(
+	const int N, int D, int M,
+	const int P,
+	const float* samples_pos,
+	const int* sample_neighbours,
+	const int* sample_idx_itselves,
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	const float* sigma_inv_cuda,
+	const float* feature_grad_cuda,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D,
+	float* ada_lpf_ratio
+	)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= N)
+		return;
+	
+	int sp_idx = sample_idx_itselves[idx];
+	int gs_idx = sample_neighbours[idx];
+
+	float x = samples_pos[sp_idx*3 + 0] - pos_cuda[gs_idx*3 + 0];
+	float y = samples_pos[sp_idx*3 + 1] - pos_cuda[gs_idx*3 + 1];
+	float z = samples_pos[sp_idx*3 + 2] - pos_cuda[gs_idx*3 + 2];
+
+	float log_pdf = 0.0;
+	log_pdf += sigma_inv_cuda[9*gs_idx + 0] * x * x;
+	log_pdf += sigma_inv_cuda[9*gs_idx + 1] * x * y * 2;
+	log_pdf += sigma_inv_cuda[9*gs_idx + 2] * x * z * 2;
+	log_pdf += sigma_inv_cuda[9*gs_idx + 4] * y * y;
+	log_pdf += sigma_inv_cuda[9*gs_idx + 5] * y * z * 2;
+	log_pdf += sigma_inv_cuda[9*gs_idx + 8] * z * z;
+
+	float cur_pdf;
+
+	if (-0.5 *log_pdf < -30){
+		cur_pdf = 0.0;
+	}
+	else {
+		cur_pdf = exp(-0.5 *log_pdf); // here the error occurs
+	}
+
+
+	float shs_r = shs_cuda[3*M*gs_idx + 0];
+	float shs_g = shs_cuda[3*M*gs_idx + 1];
+	float shs_b = shs_cuda[3*M*gs_idx + 2];
+
+	float sign_r = feature_grad_cuda[3*M*sp_idx + 0];
+	float sign_g = feature_grad_cuda[3*M*sp_idx + 1];
+	float sign_b = feature_grad_cuda[3*M*sp_idx + 2];
+
+	float sigmoid_opa = 1.0f / (1.0f + exp(-opacity_cuda[gs_idx]));;
+	float d_sigmoid_opa = (exp(-opacity_cuda[gs_idx])) / ((1.0f + exp(-opacity_cuda[gs_idx])) * (1.0f + exp(-opacity_cuda[gs_idx])));
+
+	float cur_dF_do = d_sigmoid_opa*cur_pdf*(shs_r*sign_r + shs_g*sign_g + shs_b*sign_b);
+	float cur_dF_dshs = cur_pdf*sigmoid_opa;
+	float cur_dF_dpdf = sigmoid_opa*(shs_r*sign_r + shs_g*sign_g + shs_b*sign_b);
+
+
+	if (cur_pdf * sigmoid_opa >= 0.999){
+		cur_dF_do = 0.0;
+		cur_dF_dshs = 0.999;
+		cur_dF_dpdf = 0.0;
+	}
+	else if (cur_pdf * sigmoid_opa < 0.01){
+		cur_dF_do = 0.0;
+		cur_dF_dshs = 0.0;
+		cur_dF_dpdf = 0.0;
+	}
+
+	atomicAdd(&dF_dopacity[gs_idx], cur_dF_do);
+
+	atomicAdd(&dF_dshs[3*M * gs_idx + 0], cur_dF_dshs*sign_r);
+	atomicAdd(&dF_dshs[3*M * gs_idx + 1], cur_dF_dshs*sign_g);
+	atomicAdd(&dF_dshs[3*M * gs_idx + 2], cur_dF_dshs*sign_b);
+
+	// Calculate the dF_dpos, dF_drot, and dF_dscale from dF_dpdf
+	if (cur_dF_dpdf != 0.0) {
+		computeGradsFromPDF(gs_idx, cur_dF_dpdf, log_pdf, samples_pos+sp_idx*3, sigma_inv_cuda+gs_idx*9, pos_cuda+gs_idx*3, rot_cuda+gs_idx*4, scale_cuda+gs_idx*3, dF_dpos, dF_drot, dF_dscale, dF_dcov3D, ada_lpf_ratio);
+	}
+
+}
+
+
+
 void BACKWARD::preprocess(
 	int P, int D, int M,
 	const float3* means3D,
@@ -655,3 +1312,302 @@ void BACKWARD::render(
 		dL_dcolors
 		);
 }
+
+void BACKWARD::compute3dgrads_grid(
+	const int valid_grid_num, int D, int M,
+	const int P, int S_PerGird,
+	const int* valid_grid_cuda,
+	const int* grid_gs_prefix_sum_cuda,
+	const float* samples_pos,
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	const float* sigma_cuda,
+	float* sigma_damp_cuda,
+	const float* opacity_grad_cuda,
+	const float* feature_grad_cuda,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D,
+	const int* grided_gs_idx_cuda,
+	bool* grid_is_converged_cuda,
+	bool* opt_options_cuda,
+	float3 min_xyz,
+	float grid_step,
+	int grid_num,
+	float* ada_lpf_ratio,
+	int* empty_grid_cuda,
+	int* current_static_grids_cuda,
+	int* moved_gaussians_cuda,
+	bool has_soup
+){
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop) ;
+	cudaEventRecord(start, 0);
+
+	Init3dGradsCUDA <<< (P*D*M + 255) / 256, 256 >>>(
+		P, D, M,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		dF_dcov3D
+	);
+	cudaDeviceSynchronize();
+
+	cudaEventRecord(stop, 0) ;
+	cudaEventSynchronize(stop);
+	float elapsedTime;
+	cudaEventElapsedTime(&elapsedTime, start, stop);
+	// printf("Time to initial 3d grads:  %3.1f ms\n", elapsedTime);
+
+	compute3dgradsCUDA_grid<< <valid_grid_num, S_PerGird>> > (
+		valid_grid_num, D, M,
+		P, S_PerGird,
+		valid_grid_cuda,
+		grid_gs_prefix_sum_cuda,
+		samples_pos,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		opacity_cuda,
+		shs_cuda,
+		half_length_cuda,
+		sigma_cuda,
+		sigma_damp_cuda,
+		opacity_grad_cuda,
+		feature_grad_cuda,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		dF_dcov3D,
+		grided_gs_idx_cuda,
+		grid_is_converged_cuda,
+		opt_options_cuda,
+		min_xyz,
+		grid_step,
+		grid_num,
+		ada_lpf_ratio,
+		empty_grid_cuda,
+		current_static_grids_cuda,
+		moved_gaussians_cuda,
+		has_soup
+	);
+	cudaDeviceSynchronize();
+
+	cudaEventRecord(start, 0) ;
+	cudaEventSynchronize(start);
+	cudaEventElapsedTime(&elapsedTime, stop, start);
+	printf("Time to compute 3d grads:  %3.1f ms\n", elapsedTime);
+
+	// computeGradsForAdaCov3D <<<(P + 255) / 256, 256>>>(
+	// 	P,
+	// 	dF_dcov3D,
+	// 	ada_lpf_ratio
+	// );
+	// cudaDeviceSynchronize();
+
+	computeGradsFromCov3D << <(P + 255) / 256, 256 >> >(
+		P, 
+		rot_cuda,
+		scale_cuda,
+		dF_dcov3D,
+		dF_drot,
+		dF_dscale,
+		ada_lpf_ratio,
+		opt_options_cuda
+	);
+	cudaDeviceSynchronize();
+
+	cudaEventRecord(stop, 0) ;
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&elapsedTime, start, stop);
+	// printf("Time to compute 3d grads from covariance:  %3.1f ms\n", elapsedTime);
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+}
+
+void BACKWARD::compute3dgrads( // DO NOT USE THIS IMPLEMENTATION
+	const int N, int D, int M,
+	const int P,
+	const float* samples_pos,
+	const int* sample_neighbours,
+	const int* sample_idx_itselves,
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	const float* sigma_cuda,
+	const float* feature_grad_cuda,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D
+){
+	Init3dGradsCUDA <<< (P*D*M + 255) / 256, 256 >>>(
+		P, D, M,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		dF_dcov3D
+	);
+	cudaDeviceSynchronize();
+
+
+	compute3dgradsCUDA<< <(N + 255) / 256, 256 >> > (
+		N, D, M,
+		P,
+		samples_pos,
+		sample_neighbours,
+		sample_idx_itselves,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		opacity_cuda,
+		shs_cuda,
+		half_length_cuda,
+		sigma_cuda,
+		feature_grad_cuda,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		dF_dcov3D,
+		NULL
+	);
+	cudaDeviceSynchronize();
+
+	computeGradsFromCov3D << <(P + 255) / 256, 256 >> >(
+		P, 
+		rot_cuda,
+		scale_cuda,
+		dF_dcov3D,
+		dF_drot,
+		dF_dscale,
+		NULL,
+		NULL
+	);
+	cudaDeviceSynchronize();
+	// Clip3dGradsCUDA <<< (P + 255) / 256, 256 >>>(
+	// 	N, D, M,
+	// 	P,
+	// 	dF_dopacity,
+	// 	dF_dshs,
+	// 	dF_drot,
+	// 	dF_dscale
+	// );
+	// cudaDeviceSynchronize();
+}
+
+
+void BACKWARD::updatefeature3d(
+	const int P, int D, int M,
+	const float* dF_dopacity,
+	const float* dF_dshs,
+	const float* dF_dpos,
+	const float* dF_drot,
+	const float* dF_dscale,
+	float* opacity_cuda,
+	float* shs_cuda,
+	float* pos_cuda,
+	float* rot_cuda,
+	float* scale_cuda,
+	float* m_opacity_cuda,
+	float* v_opacity_cuda,
+	float* m_shs_cuda,
+	float* v_shs_cuda,
+	float* m_pos_cuda,
+	float* v_pos_cuda,
+	float* m_rot_cuda,
+	float* v_rot_cuda,
+	float* m_scale_cuda,
+	float* v_scale_cuda,
+	float* max_scale_cuda,
+	int* step,
+	bool* opt_options_cuda,
+	float* learning_rate_cuda,
+	int _optimize_steps,
+	int* moved_gaussians_cuda
+	)
+{
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop) ;
+	cudaEventRecord(start, 0);
+
+	StepIncrement <<< 1, 256 >>>(
+		step
+	);
+	cudaDeviceSynchronize();
+
+	Updatefeature3dCUDA <<< (P + 255) / 256, 256 >>>(
+		P, D, M,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		opacity_cuda,
+		shs_cuda,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		m_opacity_cuda,
+		v_opacity_cuda,
+		m_shs_cuda,
+		v_shs_cuda,
+		m_pos_cuda,
+		v_pos_cuda,
+		m_rot_cuda,
+		v_rot_cuda,
+		m_scale_cuda,
+		v_scale_cuda,
+		max_scale_cuda,
+		step,
+		opt_options_cuda,
+		learning_rate_cuda,
+		_optimize_steps,
+		moved_gaussians_cuda
+	);
+	cudaDeviceSynchronize();
+
+	// CheckScaleCUDA <<< (P + 255) / 256, 256 >>>(
+	// 	P,
+	// 	scale_cuda,
+	// 	max_scale_cuda
+	// );
+	// cudaDeviceSynchronize();
+
+	// CheckOpacityCUDA <<< (P + 255) / 256, 256 >>>(
+	// 	P,
+	// 	opacity_cuda
+	// );
+	// cudaDeviceSynchronize();
+
+	cudaEventRecord(stop, 0) ;
+	cudaEventSynchronize(stop);
+	float elapsedTime;
+	cudaEventElapsedTime(&elapsedTime, start, stop);
+	printf("Time to update 3d features:  %3.1f ms\n", elapsedTime);
+
+}
+
+

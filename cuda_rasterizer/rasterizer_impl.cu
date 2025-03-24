@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cuda.h>
+#include <cmath>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <cub/cub.cuh>
@@ -75,7 +76,8 @@ __global__ void duplicateWithKeys(
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
-	dim3 grid)
+	dim3 grid,
+	int2* rects)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -88,7 +90,10 @@ __global__ void duplicateWithKeys(
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		if(rects == nullptr)
+			getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		else
+			getRect(points_xy[idx], rects[idx], rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
@@ -132,9 +137,9 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 			ranges[prevtile].y = idx;
 			ranges[currtile].x = idx;
 		}
+		if (idx == L - 1)
+			ranges[currtile].y = L;
 	}
-	if (idx == L - 1)
-		ranges[currtile].y = L;
 }
 
 // Mark Gaussians as visible/invisible, based on view frustum testing
@@ -216,8 +221,13 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	int* is_surface,
 	int* radii,
-	bool debug)
+	int* rects,
+	float* boxmin,
+	float* boxmax,
+	bool _to_ortho,
+	float ortho_scale)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -235,7 +245,7 @@ int CudaRasterizer::Rasterizer::forward(
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// Dynamically resize image-based auxiliary buffers during training
-	size_t img_chunk_size = required<ImageState>(width * height);
+	int img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
@@ -244,8 +254,16 @@ int CudaRasterizer::Rasterizer::forward(
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
+	float3 minn = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+	float3 maxx = { FLT_MAX, FLT_MAX, FLT_MAX };
+	if (boxmin != nullptr)
+	{
+		minn = *((float3*)boxmin);
+		maxx = *((float3*)boxmax);
+	}
+
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
-	CHECK_CUDA(FORWARD::preprocess(
+	FORWARD::preprocess(
 		P, D, M,
 		means3D,
 		(glm::vec3*)scales,
@@ -269,18 +287,27 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
-	), debug)
+		prefiltered,
+		(int2*)rects,
+		minn,
+		maxx,
+		_to_ortho,
+		ortho_scale
+	);
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
+		geomState.tiles_touched, geomState.point_offsets, P);
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost);
 
-	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	if (num_rendered == 0)
+		return 0;
+
+	int binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
@@ -294,32 +321,32 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		tile_grid)
-	CHECK_CUDA(, debug)
+		tile_grid,
+		(int2*)rects
+		);
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
-	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+	cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 32 + bit);
 
-	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+	cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2));
 
 	// Identify start and end of per-tile workloads in sorted list
-	if (num_rendered > 0)
-		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
-			num_rendered,
-			binningState.point_list_keys,
-			imgState.ranges);
-	CHECK_CUDA(, debug)
+	identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+		num_rendered,
+		binningState.point_list_keys,
+		imgState.ranges
+		);
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	CHECK_CUDA(FORWARD::render(
+	FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
@@ -330,7 +357,8 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color), debug)
+		out_color,
+		is_surface);
 
 	return num_rendered;
 }
@@ -365,8 +393,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	float* dL_dscale,
-	float* dL_drot,
-	bool debug)
+	float* dL_drot)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -387,7 +414,7 @@ void CudaRasterizer::Rasterizer::backward(
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
-	CHECK_CUDA(BACKWARD::render(
+	BACKWARD::render(
 		tile_grid,
 		block,
 		imgState.ranges,
@@ -403,13 +430,13 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor);
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
-	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+	BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,
 		radii,
 		shs,
@@ -430,5 +457,317 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot);
+}
+
+void CudaRasterizer::Rasterizer::forward3d_grid(
+	const int valid_grid_num, int D, int M,
+	const int P, int S_PerGird,
+	const int* valid_grid_cuda,
+	const int* grid_gs_prefix_sum_cuda,
+	const float* samples_pos,
+	const float* pos_cuda,
+	float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	float* sigma_cuda,
+	float* sigma_damp_cuda,
+	float* result,
+	float* feature_opacity_cuda,
+	const int* grided_gs_idx_cuda,
+	bool* grid_is_converged_cuda,
+	bool* grid_nearly_converged_cuda,
+	bool* opt_options_cuda,
+	float low_pass_param,
+	float* ada_lpf_ratio,
+	float3 min_xyz,
+	float grid_step,
+	int grid_num,
+	int* gs_init_grid_idx_cuda,
+	int* empty_grid_cuda,
+	int* current_static_grids_cuda,
+	bool has_soup
+){
+	FORWARD::compute3dfeatures_grid(
+		valid_grid_num, D, M,
+		P, S_PerGird,
+		valid_grid_cuda,
+		grid_gs_prefix_sum_cuda,
+		samples_pos,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		opacity_cuda,
+		shs_cuda,
+		half_length_cuda,
+		sigma_cuda,
+		sigma_damp_cuda,
+		result,
+		feature_opacity_cuda,
+		grided_gs_idx_cuda,
+		grid_is_converged_cuda,
+		grid_nearly_converged_cuda,
+		opt_options_cuda,
+		low_pass_param,
+		ada_lpf_ratio,
+		min_xyz,
+		grid_step,
+		grid_num,
+		gs_init_grid_idx_cuda,
+		empty_grid_cuda,
+		current_static_grids_cuda,
+		has_soup
+	);
+}
+
+
+void CudaRasterizer::Rasterizer::forward3d(
+	const int N, int D, int M,
+	const int S,
+	const int P,
+	const float* samples_pos,
+	const int* sample_neighbours,
+	const int* sample_idx_itselves,
+	const float* pos_cuda,
+	float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	float* sigma_inv_cuda,
+	float* result,
+	float* feature_opacity_cuda
+){
+	FORWARD::compute3dfeatures(
+		N, D, M,
+		S, P,
+		samples_pos,
+		sample_neighbours,
+		sample_idx_itselves,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		opacity_cuda,
+		shs_cuda,
+		half_length_cuda,
+		sigma_inv_cuda,
+		result,
+		feature_opacity_cuda
+	);
+}
+
+void CudaRasterizer::Rasterizer::backward3d_grid(
+	const int valid_grid_num, int D, int M,
+	const int P, int S_PerGird,
+	const int* valid_grid_cuda,
+	const int* grid_gs_prefix_sum_cuda,
+	const float* samples_pos,
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	const float* sigma_cuda,
+	float* sigma_damp_cuda,
+	const float* opacity_grad_cuda,
+	const float* feature_grad_cuda,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D,
+	const int* grided_gs_idx_cuda,
+	bool* grid_is_converged_cuda,
+	bool* opt_options_cuda,
+	float3 min_xyz,
+	float grid_step,
+	int grid_num,
+	float* ada_lpf_ratio,
+	int* empty_grid_cuda,
+	int* current_static_grids_cuda,
+	int* moved_gaussians_cuda,
+	bool has_soup
+){
+	BACKWARD::compute3dgrads_grid(
+		valid_grid_num, D, M,
+		P, S_PerGird,
+		valid_grid_cuda,
+		grid_gs_prefix_sum_cuda,
+		samples_pos,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		opacity_cuda,
+		shs_cuda,
+		half_length_cuda,
+		sigma_cuda,
+		sigma_damp_cuda,
+		opacity_grad_cuda,
+		feature_grad_cuda,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		dF_dcov3D,
+		grided_gs_idx_cuda,
+		grid_is_converged_cuda,
+		opt_options_cuda,
+		min_xyz,
+		grid_step,
+		grid_num,
+		ada_lpf_ratio,
+		empty_grid_cuda,
+		current_static_grids_cuda,
+		moved_gaussians_cuda,
+		has_soup
+	);
+}
+
+void CudaRasterizer::Rasterizer::backward3d(
+	const int N, int D, int M,
+	const int P,
+	const float* samples_pos,
+	const int* sample_neighbours,
+	const int* sample_idx_itselves,
+	const float* pos_cuda,
+	const float* rot_cuda,
+	const float* scale_cuda,
+	const float* opacity_cuda,
+	const float* shs_cuda,
+	const float* half_length_cuda,
+	const float* sigma_cuda,
+	const float* feature_grad_cuda,
+	float* dF_dopacity,
+	float* dF_dshs,
+	float* dF_dpos,
+	float* dF_drot,
+	float* dF_dscale,
+	float* dF_dcov3D
+){
+	BACKWARD::compute3dgrads(
+		N, D, M,
+		P,
+		samples_pos,
+		sample_neighbours,
+		sample_idx_itselves,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		opacity_cuda,
+		shs_cuda,
+		half_length_cuda,
+		sigma_cuda,
+		feature_grad_cuda,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		dF_dcov3D
+	);
+}
+
+void CudaRasterizer::Rasterizer::L1loss3d(
+	const int valid_grid_num, int D, int M,
+	const int P, int S_PerGird,
+	const float* aim_feature_cuda,
+	const float* cur_feature_cuda,
+	const float* aim_opacity_cuda,
+	const float* cur_opacity_cuda,
+	float* opacity_grad_cuda,
+	float* feature_grad_cuda,
+	float* total_feature_loss,
+	float* total_shape_loss,
+	bool* grid_is_converged_cuda,
+	bool* grid_nearly_converged_cuda,
+	float* grid_loss_sums_cuda,
+	bool* opt_options_cuda,
+	int* empty_grid_cuda,
+	bool adjust_op_range,
+	bool has_soup
+){
+	FORWARD::computeL1loss3d(
+		valid_grid_num, D, M,
+		P, S_PerGird,
+		aim_feature_cuda,
+		cur_feature_cuda,
+		aim_opacity_cuda,
+		cur_opacity_cuda,
+		opacity_grad_cuda,
+		feature_grad_cuda,
+		total_feature_loss,
+		total_shape_loss,
+		grid_is_converged_cuda,
+		grid_nearly_converged_cuda,
+		grid_loss_sums_cuda,
+		opt_options_cuda,
+		empty_grid_cuda,
+		adjust_op_range,
+		has_soup
+	);
+}
+
+void CudaRasterizer::Rasterizer::update3d(
+	const int P, int D, int M,
+	const float* dF_dopacity,
+	const float* dF_dshs,
+	const float* dF_dpos,
+	const float* dF_drot,
+	const float* dF_dscale,
+	float* opacity_cuda,
+	float* shs_cuda,
+	float* pos_cuda,
+	float* rot_cuda,
+	float* scale_cuda,
+	float* m_opacity_cuda,
+	float* v_opacity_cuda,
+	float* m_shs_cuda,
+	float* v_shs_cuda,
+	float* m_pos_cuda,
+	float* v_pos_cuda,
+	float* m_rot_cuda,
+	float* v_rot_cuda,
+	float* m_scale_cuda,
+	float* v_scale_cuda,
+	float* max_scale_cuda,
+	int* step,
+	bool* opt_options_cuda,
+	float* learning_rate_cuda,
+	int _optimize_steps,
+	int* moved_gaussians_cuda
+){
+	BACKWARD::updatefeature3d(
+		P, D, M,
+		dF_dopacity,
+		dF_dshs,
+		dF_dpos,
+		dF_drot,
+		dF_dscale,
+		opacity_cuda,
+		shs_cuda,
+		pos_cuda,
+		rot_cuda,
+		scale_cuda,
+		m_opacity_cuda,
+		v_opacity_cuda,
+		m_shs_cuda,
+		v_shs_cuda,
+		m_pos_cuda,
+		v_pos_cuda,
+		m_rot_cuda,
+		v_rot_cuda,
+		m_scale_cuda,
+		v_scale_cuda,
+		max_scale_cuda,
+		step,
+		opt_options_cuda,
+		learning_rate_cuda,
+		_optimize_steps,
+		moved_gaussians_cuda
+	);
 }
