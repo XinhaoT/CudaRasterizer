@@ -229,7 +229,7 @@ __global__ void compute3dlossCUDA(
 
 	auto idx = cg::this_grid().thread_rank();
 
-	for (int i = 0; i < shs_dim; i++){	//Only the 0-th SHs
+	for (int i = 0; i < shs_dim; i++){
 		int offset = idx*D*M + i;
 		float loss_per_dim = aim_feature_cuda[offset] - cur_feature_cuda[offset];
 
@@ -249,16 +249,12 @@ __global__ void compute3dlossCUDA(
 			atomicAdd(&total_feature_loss[0], abs(loss_per_dim));
 		}
 
-		// atomicAdd(&grid_loss_sums_cuda[grid_idx], abs(loss_per_dim));
-		// atomicMaxFloat(&grid_loss_sums_cuda[grid_idx], abs(loss_per_dim));
 		cur_sample_loss += abs(loss_per_dim);
 	}
 
 
 	if (opt_options_cuda[8]) {
 		float opacity_loss = aim_opacity_cuda[idx] - cur_opacity_cuda[idx];
-		// atomicAdd(&grid_loss_sums_cuda[grid_idx], abs(opacity_loss));
-		// cur_sample_loss += abs(opacity_loss);
 		
 		if (opacity_loss > 1e-8){
 			opacity_grad_cuda[idx] = -1.0;
@@ -270,12 +266,9 @@ __global__ void compute3dlossCUDA(
 			opacity_grad_cuda[idx] = 0.0;
 		}
 
-
-		// L0 loss 
 		if (opt_options_cuda[7]) {
 			if ((aim_opacity_cuda[idx] == 0.0f) || (aim_opacity_cuda[idx] == 0.0f)) {
 				opacity_grad_cuda[idx] = opacity_grad_cuda[idx] * 100.0;
-				// atomicAdd(&grid_loss_sums_cuda[grid_idx], abs(opacity_loss)*99.0f);
 				if (opt_options_cuda[10]) {
 					atomicAdd(&total_shape_loss[0], abs(opacity_loss) * 99.0f);
 				}
@@ -1202,7 +1195,6 @@ void FORWARD::computeL1loss3d(
 	cudaEventSynchronize(stop);
 	float elapsedTime;
 	cudaEventElapsedTime(&elapsedTime, start, stop);
-	// printf("Time to initial loss:  %3.1f ms\n", elapsedTime);
 
 	compute3dlossCUDA <<<valid_grid_num, S_PerGird>>>(
 		D, M, S,
@@ -1237,11 +1229,6 @@ void FORWARD::computeL1loss3d(
 		);
 		cudaDeviceSynchronize();
 	}
-
-	// cudaEventRecord(stop, 0) ;
-	// cudaEventSynchronize(stop);
-	// cudaEventElapsedTime(&elapsedTime, start, stop);
-	// printf("Time to judge grids' convergency:  %3.1f ms\n", elapsedTime);
 
 	cudaEventDestroy(start);
 	cudaEventDestroy(stop);
