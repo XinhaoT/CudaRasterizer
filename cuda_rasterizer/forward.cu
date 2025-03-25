@@ -230,7 +230,7 @@ __global__ void compute3dlossCUDA(
 	auto idx = cg::this_grid().thread_rank();
 
 	for (int i = 0; i < shs_dim; i++){
-		int offset = idx*D*M + i;
+		int offset = idx*shs_dim + i;
 		float loss_per_dim = aim_feature_cuda[offset] - cur_feature_cuda[offset];
 
 		
@@ -482,128 +482,6 @@ __global__ void compute3dfeaturesCUDA_grid(
 }
 
 
-// __global__ void compute3dfeaturesCUDA_grid_shared(
-// 	const int valid_grid_num, int D, int M,
-// 	const int P, int S_PerGird,
-// 	const int* valid_grid_cuda,
-// 	const int* grid_gs_prefix_sum_cuda,
-// 	const float* samples_pos,
-// 	const float* pos_cuda,
-// 	float* rot_cuda,
-// 	const float* scale_cuda,
-// 	const float* opacity_cuda,
-// 	const float* shs_cuda,
-// 	const float* half_length_cuda,
-// 	float* sigma_inv_cuda,
-// 	float* result,
-// 	float* feature_opacity_cuda,
-// 	const int* grided_gs_idx_cuda,
-// 	bool* grid_is_converged_cuda,
-// 	bool* opt_options_cuda
-// 	)
-// {
-// 	if (grid_is_converged_cuda[blockIdx.x]){
-// 		return;
-// 	}
-
-// 	int shs_dim = D;
-// 	if (opt_options_cuda[5]){
-// 		shs_dim = D*M;
-// 	}
-
-// 	auto block = cg::this_thread_block();
-// 	auto idx = cg::this_grid().thread_rank();
-// 	int grid_idx = valid_grid_cuda[blockIdx.x];
-// 	int sample_idx_in_grid = threadIdx.x;
-	
-// 	int sp_idx = blockIdx.x * S_PerGird + sample_idx_in_grid;
-// 	float sp_x = samples_pos[sp_idx*3 + 0];
-// 	float sp_y = samples_pos[sp_idx*3 + 1];
-// 	float sp_z = samples_pos[sp_idx*3 + 2];
-
-// 	int gs_idx_start = 0;
-// 	int gs_idx_end = grid_gs_prefix_sum_cuda[grid_idx];
-// 	if (grid_idx != 0){
-// 		gs_idx_start = grid_gs_prefix_sum_cuda[grid_idx-1];
-// 	}
-
-// 	int toDo = gs_idx_end - gs_idx_start;
-// 	int rounds = (toDo + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-// 	__shared__ int collected_gs_idx[BLOCK_SIZE];
-// 	__shared__ float3 collected_gs_pos[BLOCK_SIZE];
-// 	__shared__ float collected_gs_opacity[BLOCK_SIZE];
-// 	__shared__ float3 collected_gs_sigma_first_row[BLOCK_SIZE];
-// 	__shared__ float3 collected_gs_sigma_second_row[BLOCK_SIZE];
-
-// 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
-// 		int progress = i * BLOCK_SIZE + block.thread_rank();
-// 		if (gs_idx_start + progress < gs_idx_end) {
-// 			int gs_idx = grided_gs_idx_cuda[gs_idx_start + progress];
-// 			collected_gs_idx[block.thread_rank()] = gs_idx;
-
-// 			collected_gs_pos[block.thread_rank()].x = pos_cuda[gs_idx*3 + 0];
-// 			collected_gs_pos[block.thread_rank()].y = pos_cuda[gs_idx*3 + 1];
-// 			collected_gs_pos[block.thread_rank()].z = pos_cuda[gs_idx*3 + 2];
-
-// 			collected_gs_opacity[block.thread_rank()] = opacity_cuda[gs_idx];
-
-// 			collected_gs_sigma_first_row[block.thread_rank()].x = sigma_inv_cuda[9*gs_idx + 0];
-// 			collected_gs_sigma_first_row[block.thread_rank()].y = sigma_inv_cuda[9*gs_idx + 1];
-// 			collected_gs_sigma_first_row[block.thread_rank()].z = sigma_inv_cuda[9*gs_idx + 2];
-
-// 			collected_gs_sigma_second_row[block.thread_rank()].x = sigma_inv_cuda[9*gs_idx + 4];
-// 			collected_gs_sigma_second_row[block.thread_rank()].y = sigma_inv_cuda[9*gs_idx + 5];
-// 			collected_gs_sigma_second_row[block.thread_rank()].z = sigma_inv_cuda[9*gs_idx + 8];
-// 		}
-// 		block.sync();
-
-		// for (int j = 0; j < min(BLOCK_SIZE, toDo); j++){
-		// 	float x = sp_x - collected_gs_pos[j].x;
-		// 	float y = sp_y - collected_gs_pos[j].y;
-		// 	float z = sp_z - collected_gs_pos[j].z;
-
-		// 	float log_pdf = 0.0;
-		// 	log_pdf += collected_gs_sigma_first_row[j].x * x * x;
-		// 	log_pdf += collected_gs_sigma_first_row[j].y * x * y * 2;
-		// 	log_pdf += collected_gs_sigma_first_row[j].z * x * z * 2;
-		// 	log_pdf += collected_gs_sigma_second_row[j].x * y * y;
-		// 	log_pdf += collected_gs_sigma_second_row[j].y * y * z * 2;
-		// 	log_pdf += collected_gs_sigma_second_row[j].z * z * z;
-
-		// 	float cur_pdf;
-		// 	if ((-0.5 *log_pdf < -7.0f)) {
-		// 		cur_pdf = 0.0;
-		// 		continue;
-		// 	}
-		// 	else {
-		// 		cur_pdf = exp(-0.5 *log_pdf);
-		// 	}
-
-		// 	float sigmoid_opa = 1.0f / (1.0f + exp(-collected_gs_opacity[j]));
-
-		// 	float non_transparent;
-		// 	if ((cur_pdf * sigmoid_opa < 0.01)){
-		// 		non_transparent = 0.0;
-		// 		continue;
-		// 	}
-		// 	else if (cur_pdf * sigmoid_opa >= 0.999){
-		// 		non_transparent = 0.999;
-		// 	}
-		// 	else {
-		// 		non_transparent = cur_pdf * sigmoid_opa;
-		// 	}
-
-		// 	atomicAdd(&feature_opacity_cuda[sp_idx], non_transparent);
-
-		// 	for (int k = 0; k < shs_dim; k++) {
-		// 		// atomicAdd(&result[shs_dim* sp_idx + k], non_transparent * shs_cuda[shs_dim*collected_gs_idx[j] + k]);
-		// 		// atomicAdd(&result[shs_dim* sp_idx + k], non_transparent);
-		// 	}
-		// }
-
-// 	}
-// }
 
 
 __global__ void compute3dfeaturesCUDA(
