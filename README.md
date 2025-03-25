@@ -1,6 +1,8 @@
-# Differential Gaussian Rasterization
+# Differential Gaussian Radiance Fields 3D Sampler
 
-Used as the rasterization engine for the paper "3D Gaussian Splatting for Real-Time Rendering of Radiance Fields". If you can make use of it in your own research, please be so kind to cite us.
+This is an implementation of the Differential Gaussian Radiance Fields 3D Sampler, a component of the "As-Rigid-As-Possible Deformation of Gaussian Radiance Fields" paper implementation.
+
+It is an extension on the codebase of the rasterization engine for the paper "3D Gaussian Splatting for Real-Time Rendering of Radiance Fields".
 
 <section class="section" id="BibTeX">
   <div class="container is-max-desktop content">
